@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from claude_webapi import ClaudeClient, set_log_level
+from claude_webapi.constants import Model
 
 load_dotenv()
 
@@ -22,6 +23,22 @@ current_session_key: str | None = None
 class ChatRequest(BaseModel):
     text: str
     session_key: str | None = None
+    model: str | None = None
+
+def resolve_model_name(name: str | None) -> str | None:
+    """Map friendly names like 'haiku', 'sonnet', 'opus' to internal web model strings."""
+    if not name:
+        name = os.environ.get("CLAUDE_MODEL", "")
+    if not name:
+        return None
+    cleaned = name.lower().strip()
+    if "haiku" in cleaned:
+        return Model.HAIKU.value
+    if "opus" in cleaned:
+        return Model.OPUS.value
+    if "sonnet" in cleaned:
+        return Model.SONNET.value
+    return name
 
 def get_credentials_from_db():
     try:
@@ -132,7 +149,8 @@ async def health():
 @app.post("/chat")
 async def chat(req: ChatRequest):
     t0 = time.time()
-    print(f"\n[Chat] Received request ({len(req.text)} chars)")
+    target_model = resolve_model_name(req.model)
+    print(f"\n[Chat] Received request ({len(req.text)} chars, target_model: {target_model or 'default'})")
     
     try:
         await ensure_client(session_key_override=req.session_key)
@@ -147,8 +165,12 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail="Claude client not initialized")
 
     try:
-        print("[Chat] Sending prompt to Claude.ai and waiting for response...")
-        response = await client.generate_content(req.text)
+        print(f"[Chat] Sending prompt to Claude.ai ({target_model or 'default'})...")
+        if target_model:
+            response = await client.generate_content(req.text, model=target_model)
+        else:
+            response = await client.generate_content(req.text)
+            
         duration = round(time.time() - t0, 2)
         print(f"[Chat] SUCCESS! Received reply ({len(response.text)} chars) in {duration}s")
         return {"reply": response.text}
@@ -157,7 +179,7 @@ async def chat(req: ChatRequest):
         print(f"[Chat Error] generate_content failed after {duration}s: {e}")
         traceback.print_exc()
         
-        # Reset client so the next request gets a fresh session rather than staying broken
+        # Reset client so next request starts fresh
         if client is not None:
             try:
                 await client.close()
@@ -169,7 +191,8 @@ async def chat(req: ChatRequest):
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    print(f"\n[Chat Stream] Received streaming request ({len(req.text)} chars)")
+    target_model = resolve_model_name(req.model)
+    print(f"\n[Chat Stream] Received streaming request ({len(req.text)} chars, target_model: {target_model or 'default'})")
     try:
         await ensure_client(session_key_override=req.session_key)
     except Exception as e:
@@ -183,7 +206,7 @@ async def chat_stream(req: ChatRequest):
 
     async def event_generator():
         try:
-            async for chunk in client.generate_content_stream(req.text):
+            async for chunk in client.generate_content_stream(req.text, model=target_model):
                 if chunk.text_delta:
                     yield chunk.text_delta
         except Exception as err:
