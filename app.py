@@ -1,14 +1,20 @@
 import os
 import sqlite3
+import time
+import traceback
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from claude_webapi import ClaudeClient
+from claude_webapi import ClaudeClient, set_log_level
 
 load_dotenv()
+
+# Configure logging level from env (default INFO)
+log_level = os.environ.get("LOG_LEVEL", "INFO")
+set_log_level(log_level)
 
 client: ClaudeClient | None = None
 current_session_key: str | None = None
@@ -26,7 +32,6 @@ def get_credentials_from_db():
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Check column names in settings table to adapt flexibly
         cursor.execute("PRAGMA table_info(settings)")
         columns = [info[1].lower() for info in cursor.fetchall()]
         
@@ -46,7 +51,7 @@ def get_credentials_from_db():
         if row:
             return row[0], None
     except Exception as e:
-        print(f"Error reading SQLite DB: {e}")
+        print(f"[DB Warning] Error reading SQLite DB: {e}")
         
     return None, None
 
@@ -64,15 +69,23 @@ async def ensure_client(session_key_override: str | None = None):
 
     proxy = os.environ.get("CLAUDE_PROXY")
 
-    # Recreate client if missing or session key changed
-    if client is None or session_key != current_session_key:
-        print("Session key changed or client missing. Initializing ClaudeClient...")
+    # Check if existing client session is still alive
+    session_is_closed = False
+    if client is not None:
+        try:
+            session_is_closed = client._session is None or client._session.closed
+        except Exception:
+            session_is_closed = True
+
+    # Recreate client if missing, session was closed, or session key changed
+    if client is None or session_is_closed or session_key != current_session_key:
+        print("[Client] Session key changed or session closed. Initializing ClaudeClient...")
         
         if client is not None:
             try:
                 await client.close()
             except Exception as e:
-                print(f"Error closing previous ClaudeClient: {e}")
+                print(f"[Client Warning] Error closing previous ClaudeClient: {e}")
 
         # ClaudeClient will auto-discover organization_id automatically
         new_client = ClaudeClient(
@@ -80,9 +93,9 @@ async def ensure_client(session_key_override: str | None = None):
             proxy=proxy,
         )
         
-        timeout_sec = int(os.environ.get("CLAUDE_TIMEOUT", 60))
-        auto_close = os.environ.get("CLAUDE_AUTO_CLOSE", "true").lower() in ("true", "1")
-        close_delay = int(os.environ.get("CLAUDE_CLOSE_DELAY", 300))
+        timeout_sec = int(os.environ.get("CLAUDE_TIMEOUT", 180))
+        auto_close = os.environ.get("CLAUDE_AUTO_CLOSE", "false").lower() in ("true", "1")
+        close_delay = int(os.environ.get("CLAUDE_CLOSE_DELAY", 600))
 
         await new_client.init(
             timeout=timeout_sec,
@@ -92,23 +105,23 @@ async def ensure_client(session_key_override: str | None = None):
 
         client = new_client
         current_session_key = session_key
-        print(f"ClaudeClient successfully initialized (org: {new_client._organization_id}).")
+        print(f"[Client] ClaudeClient successfully initialized (org: {new_client._organization_id}).")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client
     try:
         await ensure_client()
-        print("ClaudeClient initialized successfully on startup.")
+        print("[Startup] ClaudeClient initialized successfully.")
     except Exception as e:
-        print(f"Note: ClaudeClient not initialized on startup (waiting for request or config): {e}")
+        print(f"[Startup Note] ClaudeClient not pre-initialized on startup (will initialize on first request): {e}")
     yield
     if client is not None:
         try:
             await client.close()
-            print("ClaudeClient connection closed.")
+            print("[Shutdown] ClaudeClient connection closed.")
         except Exception as e:
-            print(f"Error during ClaudeClient shutdown: {e}")
+            print(f"[Shutdown Error] Error during ClaudeClient shutdown: {e}")
 
 app = FastAPI(title="Claude WebAPI Service", lifespan=lifespan)
 
@@ -118,26 +131,50 @@ async def health():
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    t0 = time.time()
+    print(f"\n[Chat] Received request ({len(req.text)} chars)")
+    
     try:
         await ensure_client(session_key_override=req.session_key)
     except Exception as e:
+        print(f"[Chat Error] Client init failed: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Client initialization error: {str(e)}")
         
     global client
     if client is None:
+        print("[Chat Error] Claude client is None after ensure_client()")
         raise HTTPException(status_code=500, detail="Claude client not initialized")
 
     try:
+        print("[Chat] Sending prompt to Claude.ai and waiting for response...")
         response = await client.generate_content(req.text)
+        duration = round(time.time() - t0, 2)
+        print(f"[Chat] SUCCESS! Received reply ({len(response.text)} chars) in {duration}s")
         return {"reply": response.text}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        duration = round(time.time() - t0, 2)
+        print(f"[Chat Error] generate_content failed after {duration}s: {e}")
+        traceback.print_exc()
+        
+        # Reset client so the next request gets a fresh session rather than staying broken
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            client = None
+            
+        raise HTTPException(status_code=500, detail=f"Claude request failed ({type(e).__name__}): {str(e)}")
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
+    print(f"\n[Chat Stream] Received streaming request ({len(req.text)} chars)")
     try:
         await ensure_client(session_key_override=req.session_key)
     except Exception as e:
+        print(f"[Chat Stream Error] Client init failed: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Client initialization error: {str(e)}")
 
     global client
@@ -150,6 +187,8 @@ async def chat_stream(req: ChatRequest):
                 if chunk.text_delta:
                     yield chunk.text_delta
         except Exception as err:
+            print(f"[Chat Stream Error] Streaming failed: {err}")
+            traceback.print_exc()
             yield f"\n[Error: {str(err)}]"
 
     return StreamingResponse(event_generator(), media_type="text/plain")
