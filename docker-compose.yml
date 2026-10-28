@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  claude-service:
+    build:
+      context: .
+    container_name: claude-service
+    env_file:
+      - .env
+    environment:
+      SQLITE_DB_PATH: /app/data/sqlite.db
+    volumes:
+      - ../Noveral/web/data:/app/data:ro
+    ports:
+      - "3002:3002"
+    restart: unless-stopped

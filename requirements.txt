@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+claude-webapi>=1.0.352
+pydantic
+aiohttp
